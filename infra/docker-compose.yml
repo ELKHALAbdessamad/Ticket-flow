@@ -1,0 +1,8 @@
+services:
+  customer-service:
+    build:
+      context: ..
+      dockerfile: services/customer-service/Dockerfile
+    container_name: customer-service
+    ports:
+      - "8081:8081"
