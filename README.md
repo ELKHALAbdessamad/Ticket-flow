@@ -28,10 +28,10 @@ bookings, unreliable payment providers, and asynchronous notifications.
 | `customer-service` | Customer profiles (CRUD) | Spring Web, JPA | Done |
 | `api-gateway` | Single entry point, routing, rate limiting | Spring Cloud Gateway | Planned |
 | `discovery-server` | Service registry | Eureka | Planned |
-| `event-service` | Events and seats catalog | Spring Web, JPA | Planned |
+| `event-service` | Events, venues, categories and ticket catalogue | Spring Web, JPA | Done |
 | `config-server` | Centralized configuration | Spring Cloud Config | Planned |
-| `booking-service` | Booking and seat locking | OpenFeign, Resilience4J | Planned |
-| `payment-service` | Simulated payment provider (random failures) | Resilience4J | Planned |
+| `booking-service` | Reservations, payment lifecycle and per-tier inventory | OpenFeign, Resilience4J | Done |
+| `payment-service` | Payment lifecycle, simulator and Booking Service callbacks | OpenFeign, Spring Data JPA | Done |
 | `notification-service` | Confirmation emails/SMS | Kafka consumer | Planned |
 | `ai-assistant-service` | Natural-language search, recommendations | Spring AI | Later |
 

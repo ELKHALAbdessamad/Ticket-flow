@@ -1,84 +1,139 @@
 package com.ticketflow.bookingservice.entities;
 
 import com.ticketflow.bookingservice.exceptions.BookingRuleException;
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.OrderBy;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
+import jakarta.persistence.Version;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
 
 @Entity
-@Table(name = "bookings")
+@Table(name = "bookings", uniqueConstraints = @UniqueConstraint(
+        name = "uk_booking_reference", columnNames = "booking_reference"))
 public class Booking {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(nullable = false)
-    private Long eventId;
+    @Column(name = "booking_reference", nullable = false, unique = true, length = 36)
+    private String bookingReference;
 
-    /** Copied when booking: the title (and the price) shown later must not change if the event does. */
-    @Column(nullable = false, length = 150)
-    private String eventTitle;
-
-    /** Not checked against customer-service yet: the identity comes from the token in a later step. */
     @Column(nullable = false)
     private Long customerId;
 
-    @Column(nullable = false)
-    private int quantity;
-
-    @Column(nullable = false, precision = 10, scale = 2)
-    private BigDecimal unitPrice;
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 24)
+    private BookingStatus status;
 
     @Column(nullable = false, precision = 12, scale = 2)
-    private BigDecimal totalPrice;
+    private BigDecimal totalAmount;
 
-    @Enumerated(EnumType.STRING)
-    @Column(nullable = false, length = 20)
-    private BookingStatus status = BookingStatus.PENDING;
+    @Column(nullable = false, length = 3)
+    private String currency;
 
     @Column(nullable = false, updatable = false)
     private Instant createdAt;
 
-    protected Booking() { // required by JPA
+    @Column(nullable = false)
+    private Instant updatedAt;
+
+    @Column(nullable = false)
+    private Instant expiresAt;
+
+    private Instant confirmedAt;
+    private Instant cancelledAt;
+
+    @OneToMany(mappedBy = "booking", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @OrderBy("id ASC")
+    private List<BookingLine> lines = new ArrayList<>();
+
+    @Version
+    private Long version;
+
+    protected Booking() {
     }
 
-    public Booking(Long eventId, String eventTitle, Long customerId, int quantity,
-                   BigDecimal unitPrice, Instant createdAt) {
-        if (quantity < 1) {
-            throw new IllegalArgumentException("quantity must be at least 1");
-        }
-        this.eventId = eventId;
-        this.eventTitle = eventTitle;
+    public Booking(Long customerId, String currency, Instant createdAt, Instant expiresAt) {
+        this.bookingReference = UUID.randomUUID().toString();
         this.customerId = customerId;
-        this.quantity = quantity;
-        this.unitPrice = unitPrice;
-        this.totalPrice = unitPrice.multiply(BigDecimal.valueOf(quantity));
+        this.currency = currency;
+        this.status = BookingStatus.PENDING_PAYMENT;
         this.createdAt = createdAt;
+        this.updatedAt = createdAt;
+        this.expiresAt = expiresAt;
+        this.totalAmount = BigDecimal.ZERO;
     }
 
-    /** PENDING or CONFIRMED -> CANCELLED. */
-    public void cancel() {
-        if (status == BookingStatus.CANCELLED) {
-            throw new BookingRuleException("The booking is already cancelled");
+    public void addLine(Long eventId, Long ticketTierId, String eventTitle, String tierName,
+                        BigDecimal unitPrice, int quantity) {
+        BookingLine line = new BookingLine(this, eventId, ticketTierId, eventTitle, tierName, unitPrice, quantity);
+        lines.add(line);
+        totalAmount = totalAmount.add(line.getSubtotal());
+    }
+
+    public void confirm(Instant now) {
+        requirePending();
+        if (!expiresAt.isAfter(now)) {
+            throw new BookingRuleException("The reservation has expired");
         }
+        status = BookingStatus.CONFIRMED;
+        confirmedAt = now;
+        updatedAt = now;
+    }
+
+    public void expire(Instant now) {
+        requirePending();
+        if (expiresAt.isAfter(now)) {
+            throw new BookingRuleException("The reservation has not expired");
+        }
+        status = BookingStatus.EXPIRED;
+        updatedAt = now;
+    }
+
+    public void cancel(Instant now) {
+        requirePending();
         status = BookingStatus.CANCELLED;
+        cancelledAt = now;
+        updatedAt = now;
+    }
+
+    public void failPayment(Instant now) {
+        requirePending();
+        status = BookingStatus.PAYMENT_FAILED;
+        updatedAt = now;
+    }
+
+    private void requirePending() {
+        if (status != BookingStatus.PENDING_PAYMENT) {
+            throw new BookingRuleException("Only a pending-payment reservation can be transitioned");
+        }
     }
 
     public Long getId() { return id; }
-    public Long getEventId() { return eventId; }
-    public String getEventTitle() { return eventTitle; }
+    public String getBookingReference() { return bookingReference; }
     public Long getCustomerId() { return customerId; }
-    public int getQuantity() { return quantity; }
-    public BigDecimal getUnitPrice() { return unitPrice; }
-    public BigDecimal getTotalPrice() { return totalPrice; }
     public BookingStatus getStatus() { return status; }
+    public BigDecimal getTotalAmount() { return totalAmount; }
+    public String getCurrency() { return currency; }
     public Instant getCreatedAt() { return createdAt; }
+    public Instant getUpdatedAt() { return updatedAt; }
+    public Instant getExpiresAt() { return expiresAt; }
+    public Instant getConfirmedAt() { return confirmedAt; }
+    public Instant getCancelledAt() { return cancelledAt; }
+    public List<BookingLine> getLines() { return lines; }
 }

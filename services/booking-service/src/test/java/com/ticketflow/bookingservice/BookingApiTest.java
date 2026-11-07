@@ -1,27 +1,23 @@
 package com.ticketflow.bookingservice;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.jayway.jsonpath.JsonPath;
-import com.ticketflow.bookingservice.clients.EventClient;
-import com.ticketflow.bookingservice.clients.EventView;
-import feign.FeignException;
+import com.ticketflow.bookingservice.clients.EventServiceClient;
+import com.ticketflow.bookingservice.clients.dto.EventServiceEventResponse;
+import com.ticketflow.bookingservice.clients.dto.EventServiceTicketTierResponse;
+import com.ticketflow.bookingservice.service.BookingExpirationService;
 import java.math.BigDecimal;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Callable;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,218 +29,197 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
-/**
- * event-service is replaced by a mock (no Eureka, no network): what is tested here is the booking
- * logic and the seat counting. The real HTTP exchange is tested in EventClientContractTest.
- */
-@SpringBootTest(properties = "eureka.client.enabled=false")
+@SpringBootTest(properties = {
+        "eureka.client.enabled=false",
+        "ticketflow.booking.hold-duration=PT0.2S",
+        "ticketflow.booking.expiration-scan-interval=PT1H"})
 @AutoConfigureMockMvc
 class BookingApiTest {
 
-    /** Each test uses its own event id: the in-memory database is shared by the whole class. */
-    private static final AtomicLong EVENT_IDS = new AtomicLong(1000);
+    private static final AtomicLong IDS = new AtomicLong(1000);
 
     @Autowired
     MockMvc mockMvc;
 
     @MockitoBean
-    EventClient events;
+    EventServiceClient events;
 
-    // ---- helpers ----
+    @Autowired
+    BookingExpirationService expirationService;
 
-    private Long eventWith(int capacity, String price, String status, Instant startsAt) {
-        Long id = EVENT_IDS.incrementAndGet();
-        when(events.get(id)).thenReturn(new EventView(id, "Jazz night", startsAt, new BigDecimal(price), capacity, status));
-        return id;
+    private long prepareCatalog(int quantity) {
+        long eventId = IDS.incrementAndGet();
+        long tierId = eventId + 100_000;
+        Instant start = Instant.now().plusSeconds(3600);
+        when(events.getEvent(eventId)).thenReturn(new EventServiceEventResponse(eventId, "Jazz night",
+                start, null, start.plusSeconds(7200), "PUBLISHED", quantity, List.of()));
+        when(events.getTicketTier(eventId, tierId)).thenReturn(new EventServiceTicketTierResponse(tierId,
+                "Standard", new BigDecimal("125.50"), quantity, Instant.now().minusSeconds(10),
+                start.minusSeconds(30), eventId));
+        return eventId;
     }
 
-    private Long publishedEvent(int capacity) {
-        return eventWith(capacity, "150.00", "PUBLISHED", Instant.now().plus(30, ChronoUnit.DAYS));
+    private String request(long eventId, long tierId, int quantity, long customerId, String key) {
+        return """
+                {"eventId":%d,"customerId":%d,"lines":[{"ticketTierId":%d,"quantity":%d}],
+                 "idempotencyKey":"%s"}
+                """.formatted(eventId, customerId, tierId, quantity, key);
     }
 
-    private static FeignException feignError(int status) {
-        FeignException e = mock(FeignException.class);
-        when(e.status()).thenReturn(status);
-        return e;
+    private String key() {
+        return "booking-" + UUID.randomUUID();
     }
 
-    private static String body(Long eventId, long customerId, int quantity) {
-        return "{\"eventId\":" + eventId + ",\"customerId\":" + customerId + ",\"quantity\":" + quantity + "}";
-    }
-
-    private int book(Long eventId, long customerId, int quantity) throws Exception {
-        return mockMvc.perform(post("/api/bookings")
-                        .contentType(MediaType.APPLICATION_JSON).content(body(eventId, customerId, quantity)))
-                .andReturn().getResponse().getStatus();
-    }
-
-    private Integer bookedId(Long eventId, long customerId, int quantity) throws Exception {
-        String json = mockMvc.perform(post("/api/bookings")
-                        .contentType(MediaType.APPLICATION_JSON).content(body(eventId, customerId, quantity)))
+    private String create(long eventId, long tierId, int quantity, long customerId, String key) throws Exception {
+        return mockMvc.perform(post("/api/v1/bookings").contentType(MediaType.APPLICATION_JSON)
+                        .content(request(eventId, tierId, quantity, customerId, key)))
                 .andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString();
-        Integer id = JsonPath.read(json, "$.id");
-        return id;
     }
 
-    // ---- booking ----
-
     @Test
-    void booksSeatsAndSnapshotsThePrice() throws Exception {
-        Long event = publishedEvent(10);
+    void createsSnapshotsIdempotentlyAndReportsPerTierStock() throws Exception {
+        long eventId = prepareCatalog(5);
+        long tierId = eventId + 100_000;
+        String key = key();
+        String body = request(eventId, tierId, 2, 42, key);
 
-        mockMvc.perform(post("/api/bookings")
-                        .contentType(MediaType.APPLICATION_JSON).content(body(event, 42, 2)))
+        String first = mockMvc.perform(post("/api/v1/bookings").contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isCreated())
                 .andExpect(header().exists("Location"))
-                .andExpect(jsonPath("$.status").value("PENDING"))
-                .andExpect(jsonPath("$.customerId").value(42))
-                .andExpect(jsonPath("$.eventTitle").value("Jazz night"))
-                .andExpect(jsonPath("$.unitPrice").value(150.0))
-                .andExpect(jsonPath("$.totalPrice").value(300.0));
+                .andExpect(jsonPath("$.status").value("PENDING_PAYMENT"))
+                .andExpect(jsonPath("$.lines[0].eventTitle").value("Jazz night"))
+                .andExpect(jsonPath("$.lines[0].ticketTierName").value("Standard"))
+                .andExpect(jsonPath("$.lines[0].unitPrice").value(125.5))
+                .andExpect(jsonPath("$.totalAmount").value(251.0))
+                .andReturn().getResponse().getContentAsString();
+
+        String originalReference = com.jayway.jsonpath.JsonPath.read(first, "$.bookingReference");
+        mockMvc.perform(post("/api/v1/bookings").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.bookingReference").value((Object) originalReference));
+        mockMvc.perform(post("/api/v1/bookings").contentType(MediaType.APPLICATION_JSON)
+                        .content(request(eventId, tierId, 3, 42, key)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.timestamp").exists())
+                .andExpect(jsonPath("$.path").value("/api/v1/bookings"));
+        mockMvc.perform(get("/api/v1/inventory/events/{eventId}/ticket-tiers/{tierId}", eventId, tierId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalQuantity").value(5))
+                .andExpect(jsonPath("$.reservedQuantity").value(2))
+                .andExpect(jsonPath("$.availableQuantity").value(3));
     }
 
     @Test
-    void rejectsInvalidRequests() throws Exception {
-        Long event = publishedEvent(10);
+    void confirmationCancellationAndPaymentFailureMoveInventoryOnce() throws Exception {
+        long eventId = prepareCatalog(4);
+        long tierId = eventId + 100_000;
+        String created = create(eventId, tierId, 2, 55, key());
+        int id = com.jayway.jsonpath.JsonPath.read(created, "$.id");
 
-        assertThat(book(event, 42, 0)).isEqualTo(400);
-        assertThat(book(event, 42, 11)).isEqualTo(400);
-        assertThat(book(event, 0, 1)).isEqualTo(400); // customerId must be positive
-        mockMvc.perform(post("/api/bookings")
-                        .contentType(MediaType.APPLICATION_JSON).content("{\"customerId\":42,\"quantity\":1}"))
-                .andExpect(status().isBadRequest());
-        mockMvc.perform(post("/api/bookings")
-                        .contentType(MediaType.APPLICATION_JSON).content("{\"eventId\":" + event + ",\"quantity\":1}"))
-                .andExpect(status().isBadRequest());
-    }
+        mockMvc.perform(patch("/api/v1/internal/bookings/{id}/confirm", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CONFIRMED"))
+                .andExpect(jsonPath("$.confirmedAt").exists());
+        mockMvc.perform(patch("/api/v1/internal/bookings/{id}/confirm", id))
+                .andExpect(status().isConflict());
+        mockMvc.perform(get("/api/v1/inventory/events/{eventId}/ticket-tiers/{tierId}", eventId, tierId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.reservedQuantity").value(0))
+                .andExpect(jsonPath("$.soldQuantity").value(2));
 
-    @Test
-    void answers404WhenTheEventDoesNotExist() throws Exception {
-        FeignException notFound = feignError(404);
-        when(events.get(anyLong())).thenThrow(notFound);
+        long event2 = prepareCatalog(4);
+        long tier2 = event2 + 100_000;
+        int failedId = com.jayway.jsonpath.JsonPath.read(create(event2, tier2, 1, 56, key()), "$.id");
+        mockMvc.perform(patch("/api/v1/internal/bookings/{id}/payment-failed", failedId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PAYMENT_FAILED"));
 
-        assertThat(book(987654L, 42, 1)).isEqualTo(404);
-    }
-
-    @Test
-    void refusesAnEventThatIsNotOpenOrAlreadyStarted() throws Exception {
-        Long closed = eventWith(10, "10.00", "CLOSED", Instant.now().plus(5, ChronoUnit.DAYS));
-        Long draft = eventWith(10, "10.00", "DRAFT", Instant.now().plus(5, ChronoUnit.DAYS));
-        Long past = eventWith(10, "10.00", "PUBLISHED", Instant.now().minus(1, ChronoUnit.HOURS));
-
-        assertThat(book(closed, 42, 1)).isEqualTo(409);
-        assertThat(book(draft, 42, 1)).isEqualTo(409);
-        assertThat(book(past, 42, 1)).isEqualTo(409);
-    }
-
-    @Test
-    void answers503WhenEventServiceIsDown() throws Exception {
-        Long unreachable = publishedEvent(10);
-        FeignException noConnection = feignError(-1);
-        when(events.get(unreachable)).thenThrow(noConnection);
-        Long failing = publishedEvent(10);
-        FeignException serverError = feignError(500);
-        when(events.get(failing)).thenThrow(serverError);
-
-        assertThat(book(unreachable, 42, 1)).isEqualTo(503);
-        assertThat(book(failing, 42, 1)).isEqualTo(503);
-    }
-
-    // ---- seats ----
-
-    @Test
-    void neverSellsMoreSeatsThanTheCapacity() throws Exception {
-        Long event = publishedEvent(3);
-
-        assertThat(book(event, 42, 2)).isEqualTo(201);
-        assertThat(book(event, 42, 2)).isEqualTo(409); // only one seat left
-        assertThat(book(event, 42, 1)).isEqualTo(201);
-        assertThat(book(event, 42, 1)).isEqualTo(409); // sold out
-    }
-
-    @Test
-    void cancellingGivesTheSeatsBack() throws Exception {
-        Long event = publishedEvent(2);
-        Integer id = bookedId(event, 42, 2);
-        assertThat(book(event, 42, 1)).isEqualTo(409);
-
-        mockMvc.perform(post("/api/bookings/{id}/cancel", id))
+        long event3 = prepareCatalog(2);
+        long tier3 = event3 + 100_000;
+        int cancelledId = com.jayway.jsonpath.JsonPath.read(create(event3, tier3, 2, 57, key()), "$.id");
+        mockMvc.perform(patch("/api/v1/bookings/{id}/cancel", cancelledId))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
-
-        assertThat(book(event, 42, 2)).isEqualTo(201);
-        // cancelling twice must not release the seats twice
-        mockMvc.perform(post("/api/bookings/{id}/cancel", id)).andExpect(status().isConflict());
-        assertThat(book(event, 42, 1)).isEqualTo(409);
+        mockMvc.perform(patch("/api/v1/bookings/{id}/cancel", cancelledId))
+                .andExpect(status().isConflict());
     }
 
-    /**
-     * The dangerous moment is the FIRST booking of an event, when several requests create its seat
-     * counter at the same time (a bug there once reset the counter and sold 6 seats out of 3, in about
-     * 1 round out of 15). One round proves little, so the scenario is repeated on fresh events.
-     */
     @Test
-    void concurrentBookingsOfTheLastSeatsCannotOversell() throws Exception {
+    void expiredReservationsReleaseTheirStockAndCannotBeConfirmed() throws Exception {
+        long eventId = prepareCatalog(2);
+        long tierId = eventId + 100_000;
+        int id = com.jayway.jsonpath.JsonPath.read(create(eventId, tierId, 1, 77, key()), "$.id");
+        Thread.sleep(300);
+
+        assertThat(expirationService.expire((long) id)).isTrue();
+        mockMvc.perform(patch("/api/v1/internal/bookings/{id}/confirm", id))
+                .andExpect(status().isConflict());
+        mockMvc.perform(get("/api/v1/bookings/{id}", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("EXPIRED"));
+        mockMvc.perform(get("/api/v1/inventory/events/{eventId}/ticket-tiers/{tierId}", eventId, tierId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.reservedQuantity").value(0))
+                .andExpect(jsonPath("$.availableQuantity").value(2));
+    }
+
+    @Test
+    void rejectsUnpublishedEventsAndUnavailableTicketTiers() throws Exception {
+        long eventId = IDS.incrementAndGet();
+        long tierId = eventId + 100_000;
+        Instant start = Instant.now().plusSeconds(3600);
+        when(events.getEvent(eventId)).thenReturn(new EventServiceEventResponse(eventId, "Draft event",
+                start, start, start.plusSeconds(7200), "DRAFT", 10, List.of()));
+        mockMvc.perform(post("/api/v1/bookings").contentType(MediaType.APPLICATION_JSON)
+                        .content(request(eventId, tierId, 1, 90, key())))
+                .andExpect(status().isConflict());
+
+        long otherEvent = prepareCatalog(10);
+        long otherTier = otherEvent + 100_000;
+        when(events.getTicketTier(otherEvent, otherTier)).thenReturn(new EventServiceTicketTierResponse(
+                otherTier, "Standard", BigDecimal.TEN, 10, Instant.now().plusSeconds(600),
+                start.minusSeconds(30), otherEvent));
+        mockMvc.perform(post("/api/v1/bookings").contentType(MediaType.APPLICATION_JSON)
+                        .content(request(otherEvent, otherTier, 1, 90, key())))
+                .andExpect(status().isConflict());
+    }
+
+    @Test
+    void concurrentRequestsCannotOversellAndReadRoutesReturnSnapshots() throws Exception {
         int capacity = 3;
-        int attempts = 8;
-        int rounds = 40;
-
-        for (int round = 0; round < rounds; round++) {
-            Long event = publishedEvent(capacity);
-
-            ExecutorService pool = Executors.newFixedThreadPool(attempts);
-            CountDownLatch start = new CountDownLatch(1);
-            List<Future<Integer>> results = new ArrayList<>();
-            for (int i = 0; i < attempts; i++) {
-                long customer = 100 + i;
-                Callable<Integer> attempt = () -> {
-                    start.await();
-                    return book(event, customer, 1);
-                };
-                results.add(pool.submit(attempt));
-            }
-            start.countDown();
-
-            int created = 0;
-            for (Future<Integer> result : results) {
-                int code = result.get();
-                assertThat(code).isIn(201, 409);
-                if (code == 201) {
-                    created++;
-                }
-            }
-            pool.shutdown();
-            assertThat(created).as("seats sold in round %d", round).isEqualTo(capacity);
+        long eventId = prepareCatalog(capacity);
+        long tierId = eventId + 100_000;
+        var executor = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<Integer>> attempts = new java.util.ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            long customerId = 1000 + i;
+            attempts.add(executor.submit(() -> {
+                start.await();
+                return mockMvc.perform(post("/api/v1/bookings").contentType(MediaType.APPLICATION_JSON)
+                                .content(request(eventId, tierId, 1, customerId, key())))
+                        .andReturn().getResponse().getStatus();
+            }));
         }
-    }
+        start.countDown();
+        int created = 0;
+        for (Future<Integer> attempt : attempts) {
+            int status = attempt.get();
+            assertThat(status).isIn(201, 409);
+            if (status == 201) {
+                created++;
+            }
+        }
+        executor.shutdown();
+        assertThat(created).isEqualTo(capacity);
 
-    // ---- reading ----
-
-    @Test
-    void readsABookingAndAnUnknownOneIs404() throws Exception {
-        Long event = publishedEvent(10);
-        Integer id = bookedId(event, 42, 1);
-
-        mockMvc.perform(get("/api/bookings/{id}", id))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.eventId").value(event));
-        mockMvc.perform(get("/api/bookings/{id}", 987654)).andExpect(status().isNotFound());
-        mockMvc.perform(post("/api/bookings/{id}/cancel", 987654)).andExpect(status().isNotFound());
-    }
-
-    @Test
-    void listsAllBookingsOrOnlyThoseOfOneCustomer() throws Exception {
-        Long event = publishedEvent(10);
-        long customer = 7000 + EVENT_IDS.incrementAndGet(); // unique: the database is shared by the class
-        bookedId(event, customer, 1);
-        bookedId(event, customer, 2);
-        bookedId(event, customer + 1, 1);
-
-        mockMvc.perform(get("/api/bookings").param("customerId", String.valueOf(customer)))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.length()").value(2));
-        mockMvc.perform(get("/api/bookings"))
+        mockMvc.perform(get("/api/v1/bookings/customer/{customerId}", 1000)
+                        .param("page", "0").param("size", "10"))
                 .andExpect(status().isOk());
+        mockMvc.perform(get("/api/v1/inventory/events/{eventId}", eventId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].reservedQuantity").value(3))
+                .andExpect(jsonPath("$[0].availableQuantity").value(0));
     }
 }

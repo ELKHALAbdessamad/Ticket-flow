@@ -1,141 +1,101 @@
-# booking-service
+# Booking Service
 
-> Seat reservations: the first service that **calls another service**.
+Booking Service owns reservations and per-ticket-tier inventory. Event Service remains the
+source of truth for events and offers; Booking Service communicates with its internal
+read-only HTTP API and stores only event/tier identifiers and immutable name/price
+snapshots. No Event Service database or JPA entities are shared.
 
-## Concept illustrated
-- **OpenFeign**: `EventClient` is a plain Java interface; Spring generates the HTTP code. It addresses
-  `event-service` **by its Eureka name**, load-balanced, so the address of the other service is never written down.
-- **Synchronous call, on purpose**: to book, we need the answer *now* (does the event exist? is it published?
-  what is its price and capacity?). A question that needs an immediate answer is a REST call; a fact that can be
-  processed later is an event (Kafka, a later step).
-- **Our own view of the contract**: `EventView` keeps only the 6 fields booking needs and ignores the rest, so
-  `event-service` can add fields without breaking this service.
-- **Bounded waiting**: connect 2 s, read 3 s. Without timeouts, one slow service freezes this one too.
-  `EventClientContractTest` proves it with a real slow server.
-- **No overselling**: seats are counted in `seat_inventory`; reserving is **one atomic
-  `UPDATE ... WHERE held + :q <= :capacity`**. Counting bookings and then inserting would be a race (two requests
-  see one free seat). `BookingApiTest` fires 8 concurrent requests at 3 seats and expects exactly 3 successes.
-- **Remote call before the transaction**: a slow service must not hold a database connection.
+## Booking lifecycle and inventory
 
-## Overview
-- **Port:** 8083
-- **Database:** H2 in memory (recreated on every start)
-- **Depends on:** `event-service` (through Eureka)
+`PENDING_PAYMENT` holds stock until payment confirmation, cancellation, payment failure,
+or expiration. A successful trusted payment callback changes the reservation to
+`CONFIRMED` and atomically transfers every line's quantity from reserved to sold.
+Cancellation, payment failure and expiration release held stock once. Confirmed bookings
+are not refundable through this API. A row lock on the booking serializes payment,
+cancellation and expiration transitions.
 
-| Method | Path | Description |
+Inventory is tracked per ticket tier:
+
+```
+availableQuantity = totalQuantity - reservedQuantity - soldQuantity
+```
+
+Reservation uses a conditional database `UPDATE` against the inventory row, so simultaneous
+requests cannot oversell. Inventory sync updates reference quantities without resetting
+reserved/sold counts, and refuses a catalog decrease below already reserved or sold units.
+The inventory version is incremented with each atomic update. Each booking snapshots the
+event/tier names and unit price; the backend calculates line subtotals and the total.
+
+Idempotency is scoped to `(customerId, idempotencyKey)` with a database unique constraint.
+The request hash is based on the event, customer and normalized ticket lines. Replaying the
+same request returns the original booking; reusing the key for a different request returns
+409.
+
+## REST API
+
+All endpoints are under `/api/v1`.
+
+| Method | Path | Purpose and responses |
 |---|---|---|
-| POST | `/api/bookings` | Book `quantity` (1-10) seats of a PUBLISHED, not yet started event. 201 + Location, status `PENDING` |
-| GET | `/api/bookings` | All bookings, newest first. Optional `?customerId=` filter |
-| GET | `/api/bookings/{id}` | One booking |
-| POST | `/api/bookings/{id}/cancel` | Cancel and give the seats back (409 if already cancelled) |
+| POST | `/bookings` | Create temporary reservation; `201`, `400`, `404`, `409`, `503` |
+| GET | `/bookings/{id}` | Booking detail by ID; `200`, `404` |
+| GET | `/bookings/reference/{reference}` | Booking detail by non-predictable reference; `200`, `404` |
+| GET | `/bookings/customer/{customerId}?page=0&size=20` | Paginated customer history; `200`, `400` |
+| PATCH | `/bookings/{id}/cancel` | Cancel pending reservation and release holds; `200`, `404`, `409` |
+| PATCH | `/internal/bookings/{id}/confirm` | Trusted payment callback; `200`, `404`, `409` |
+| PATCH | `/internal/bookings/{id}/payment-failed` | Trusted payment failure callback; `200`, `404`, `409` |
+| GET | `/inventory/events/{eventId}` | Inventory by tier for an event |
+| GET | `/inventory/events/{eventId}/ticket-tiers/{ticketTierId}` | Inventory for one tier |
 
-Request: `{ "eventId": 5, "customerId": 42, "quantity": 2 }`. The unit price and the event title are **copied**
-into the booking: a later price change does not alter what the customer agreed to.
+`customerId` is accepted in the development API until authentication is integrated.
+Payment callback routes and Event Service internal routes are not authenticated in this
+development stage: restrict them to trusted service-to-service network traffic or add
+service authentication before production. Swagger UI is at `/swagger-ui.html`; OpenAPI
+JSON is at `/v3/api-docs`.
 
-> **Known limits of this step.** There is no security yet: `customerId` is taken from the request and is not
-> checked against `customer-service`, and anybody can read or cancel any booking. The identity will come from the
-> token in the security step. A booking stays `PENDING` until cancelled: `CONFIRMED` comes with the payment.
+## Event Service contract and resilience
 
-Errors (RFC 9457): 400 invalid quantity / customer / missing event, 404 unknown event or booking,
-409 sold out / event not open / event already started / already cancelled, 503 `event-service` did not answer.
+Booking uses the existing internal catalogue contracts:
 
-## Calling event-service
-`EVENT_SERVICE_URL` overrides the Eureka name: `EVENT_SERVICE_URL=http://localhost:8082` runs booking with only
-`event-service` started (no Eureka needed). Leave it empty to use the name.
-Retries, circuit breaker and fallbacks are the subject of the resilience step: today a failure is just a clean 503.
+* `GET /api/v1/internal/events/{eventId}`
+* `GET /api/v1/internal/events/{eventId}/ticket-tiers/{ticketTierId}`
 
-## Run
-```bash
-# 1. an event, published (needs event-service on 8082)
-curl -X POST localhost:8082/api/events -H 'Content-Type: application/json' \
-  -d '{"title":"Jazz night","description":"Live","venue":"Casablanca","startsAt":"2030-01-01T20:00:00Z","price":150,"capacity":3}'
-curl -X POST localhost:8082/api/events/1/publish
+Event Service provides these internal routes using its existing event/tier DTOs. Public
+catalogue GET routes continue to hide drafts. Booking refuses creation when either
+catalogue lookup fails, the event is not published or has started, the tier belongs to a
+different event, or its sale window is closed.
 
-# 2. booking-service, pointing to event-service directly (no Eureka)
-EVENT_SERVICE_URL=http://localhost:8082 ./mvnw -pl services/booking-service spring-boot:run
+OpenFeign routes through Eureka (`event-service`) or `EVENT_SERVICE_URL` for local runs.
+Connect/read timeouts, Resilience4j circuit breaker/retry/TimeLimiter, temporary hold
+duration, currency, quantity limit and expiration scan settings are configurable in
+`src/main/resources/application.yml`. Retries apply only to idempotent catalogue reads,
+never to booking creation or inventory mutations. Catalogue failures are returned as
+503; no local fallback fabricates event or price information.
 
-# 3. book
-curl -X POST localhost:8083/api/bookings -H 'Content-Type: application/json' \
-  -d '{"eventId":1,"customerId":42,"quantity":2}'
-```
-With Docker Compose (Eureka + Config Server), leave `EVENT_SERVICE_URL` empty: the name `event-service` is resolved
-by Eureka. Through the gateway (discovery locator): `http://localhost:8080/booking-service/api/bookings`.
+## Example
 
-## Manual test scenario
-Try the service with real HTTP requests, without Eureka or the Config Server (the "connection refused" warnings
-about ports 8761 and 8888 can be ignored).
+Create a booking (the event and ticket tier must exist and be published/in sale):
 
-**1. Start the two services** (IntelliJ or `./mvnw -pl services/<name> spring-boot:run`)
-- `event-service` on port 8082, no setting needed.
-- `booking-service` on port 8083 with the environment variable `EVENT_SERVICE_URL=http://localhost:8082`.
-  Without it, the service looks for `event-service` in Eureka.
-
-**2. Create and publish an event with 3 seats** (use the id returned by the creation if it is not 1)
-```bash
-curl -s -X POST localhost:8082/api/events -H 'Content-Type: application/json' \
-  -d '{"title":"Jazz night","description":"Live","venue":"Casablanca","startsAt":"2030-01-01T20:00:00Z","price":150,"capacity":3}'
-curl -s -X POST localhost:8082/api/events/1/publish
+```powershell
+curl.exe -i -X POST http://localhost:8083/api/v1/bookings `
+  -H "Content-Type: application/json" `
+  -d '{"eventId":12,"customerId":42,"lines":[{"ticketTierId":31,"quantity":2}],"idempotencyKey":"checkout-42-a81c4f"}'
 ```
 
-**3. Booking and seat counting**
+When payment has been independently verified, the trusted Payment Service will call
+`PATCH /api/v1/internal/bookings/{id}/confirm`. Creating a booking does not imply payment
+success. Pending holds are expired by the scheduled expiration worker.
 
-| Request | Expected result |
-|---|---|
-| `POST /api/bookings` `{"eventId":1,"customerId":42,"quantity":2}` | **201**, `status: PENDING`, `totalPrice: 300`, `Location` header |
-| the same request again (only 1 seat left) | **409** "Not enough seats left" |
-| `POST /api/bookings` `{"eventId":1,"customerId":43,"quantity":1}` | **201** (last seat) |
-| the same request again | **409** (sold out) |
-| `POST /api/bookings/1/cancel` | **200**, `status: CANCELLED`, 2 seats given back |
-| `POST /api/bookings/1/cancel` again | **409** "already cancelled" (the seats are not released twice) |
-| `POST /api/bookings` `{"eventId":1,"customerId":44,"quantity":2}` | **201** (the released seats can be booked again) |
-| `GET /api/bookings/1` | **200** |
-| `GET /api/bookings?customerId=42` | **200**, only the bookings of customer 42 |
-| `GET /api/bookings/999` | **404** |
+## Run and test
 
-```bash
-curl -i -X POST localhost:8083/api/bookings -H 'Content-Type: application/json' \
-  -d '{"eventId":1,"customerId":42,"quantity":2}'
-curl -i -X POST localhost:8083/api/bookings/1/cancel
-curl -i 'localhost:8083/api/bookings?customerId=42'
+From the repository root:
+
+```powershell
+.\mvnw.cmd -f services/booking-service/pom.xml spring-boot:run
+.\mvnw.cmd -f services/booking-service/pom.xml test
 ```
 
-**4. Errors that come from the call to event-service**
-
-| Situation | Expected result |
-|---|---|
-| unknown event: `{"eventId":999,"customerId":42,"quantity":1}` | **404** |
-| event still in `DRAFT` (created, not published) | **409** "not open for booking" |
-| invalid request: `{"eventId":1,"quantity":0}` (no customer, quantity < 1) | **400** |
-
-**5. event-service stopped**
-
-Stop `event-service`, then book:
-```bash
-curl -i -X POST localhost:8083/api/bookings -H 'Content-Type: application/json' \
-  -d '{"eventId":1,"customerId":42,"quantity":1}'
-```
-Expected: **503** "The event service is temporarily unavailable, please retry". The connection is refused, so the
-answer is almost immediate; a service that is up but too slow is cut off after the 3 s read timeout
-(`EventClientContractTest` checks this). Restart `event-service` and booking works again. The H2 database of
-`event-service` is in memory: its events must be created again.
-
-**6. Through Eureka and the gateway (optional)**
-
-Start `discovery-server` (8761) and `api-gateway` (8080), remove `EVENT_SERVICE_URL`, wait about 30 s for the
-registration, then call `localhost:8080/booking-service/api/bookings`. This proves that the name `event-service` is
-resolved by Eureka, which the automated tests do not cover.
-
-## Tests
-```bash
-./mvnw -pl services/booking-service test
-```
-- `BookingApiTest`: booking rules, seat counting, concurrency (event-service mocked).
-- `EventClientContractTest`: a fake `event-service` on a random port and the **real** Feign client: contract, 404,
-  read timeout, and the end-to-end booking.
-- `BookingTest`: the booking domain object.
-
-## Exercises
-1. Stop `event-service` and book: which status do you get, and after how long? Why does the timeout matter?
-2. Make `EventView` stricter (remove `@JsonIgnoreProperties`) and add a field to `EventResponse`: what breaks, and where?
-3. Replace the atomic `UPDATE` by "count, then insert" and run `concurrentBookingsOfTheLastSeatsCannotOversell`.
-4. Add `?status=PENDING` to `GET /api/bookings`.
+The service uses H2 in-memory by default, listens on port `8083`, and can start without
+Eureka or Config Server. For a local Event Service, set `EVENT_SERVICE_URL=http://localhost:8082`.
+Tests exercise idempotency, lifecycle transitions, expiration, the actual Feign HTTP
+contract, and concurrent requests for the last tier units.

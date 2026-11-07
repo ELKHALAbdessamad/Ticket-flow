@@ -1,8 +1,9 @@
 package com.ticketflow.eventservice.controllers;
 
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -24,116 +25,100 @@ class EventControllerTest {
     @Autowired
     MockMvc mockMvc;
 
-    private static String body(String title, Instant startsAt, int capacity) {
-        return """
-                {"title":"%s","description":"Live","venue":"Casablanca","startsAt":"%s","price":150.00,"capacity":%d}
-                """.formatted(title, startsAt, capacity);
-    }
-
-    private static String body(String title, int capacity) {
-        return body(title, Instant.now().plus(30, ChronoUnit.DAYS), capacity);
-    }
-
-    private static String uniqueTitle(String prefix) {
-        return prefix + "-" + UUID.randomUUID();
-    }
-
-    /** Creates a DRAFT event and returns its id, read from the Location header. */
-    private String createEvent(String title, int capacity) throws Exception {
-        String location = mockMvc.perform(post("/api/events")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body(title, capacity)))
-                .andExpect(status().isCreated())
-                .andReturn().getResponse().getHeader("Location");
-        return location.substring(location.lastIndexOf('/') + 1);
-    }
-
     @Test
-    void createReturns201WithLocationAndADraft() throws Exception {
-        mockMvc.perform(post("/api/events")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body(uniqueTitle("concert"), 100)))
+    void managesDraftsAndOnlyPublishesEventsWithValidTicketOffers() throws Exception {
+        long venueId = createVenue();
+        long categoryId = createCategory();
+        String title = "Event-" + UUID.randomUUID();
+        Instant start = Instant.now().plus(30, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS);
+        Instant end = start.plus(3, ChronoUnit.HOURS);
+        String eventBody = """
+                {"title":"%s","description":"A live event","startDateTime":"%s","endDateTime":"%s",
+                 "imageUrl":"https://example.test/event.png","venueId":%d,"categoryId":%d,"capacity":100}
+                """.formatted(title, start, end, venueId, categoryId);
+        String location = mockMvc.perform(post("/api/v1/events").contentType(MediaType.APPLICATION_JSON)
+                        .content(eventBody))
                 .andExpect(status().isCreated())
                 .andExpect(header().exists("Location"))
                 .andExpect(jsonPath("$.status").value("DRAFT"))
-                .andExpect(jsonPath("$.capacity").value(100));
-    }
+                .andReturn().getResponse().getHeader("Location");
+        String eventId = location.substring(location.lastIndexOf('/') + 1);
 
-    @Test
-    void rejectsABlankTitleAndAZeroCapacity() throws Exception {
-        mockMvc.perform(post("/api/events")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body("", 0)))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    void rejectsAStartDateInThePast() throws Exception {
-        mockMvc.perform(post("/api/events")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body(uniqueTitle("old"), Instant.now().minus(1, ChronoUnit.DAYS), 100)))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    void theCatalogListsOnlyPublishedEvents() throws Exception {
-        String draftTitle = uniqueTitle("draft");
-        String publishedTitle = uniqueTitle("published");
-        createEvent(draftTitle, 100);
-        String publishedId = createEvent(publishedTitle, 100);
-        mockMvc.perform(post("/api/events/{id}/publish", publishedId)).andExpect(status().isOk());
-
-        mockMvc.perform(get("/api/events"))
+        mockMvc.perform(get("/api/v1/events/{id}", eventId))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.path").value("/api/v1/events/" + eventId));
+        mockMvc.perform(get("/api/v1/management/events/{id}", eventId))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$[?(@.title=='" + publishedTitle + "')]").isNotEmpty())
-                .andExpect(jsonPath("$[?(@.title=='" + draftTitle + "')]").isEmpty());
-    }
-
-    @Test
-    void publishThenClose() throws Exception {
-        String id = createEvent(uniqueTitle("flow"), 100);
-
-        mockMvc.perform(post("/api/events/{id}/publish", id))
+                .andExpect(jsonPath("$.venue.city").value("Rabat"));
+        mockMvc.perform(get("/api/v1/internal/events/{id}", eventId))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("PUBLISHED"));
-
-        mockMvc.perform(post("/api/events/{id}/close", id))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("CLOSED"));
-    }
-
-    @Test
-    void invalidTransitionsReturn409() throws Exception {
-        String id = createEvent(uniqueTitle("transition"), 100);
-
-        // a DRAFT cannot be closed
-        mockMvc.perform(post("/api/events/{id}/close", id)).andExpect(status().isConflict());
-
-        mockMvc.perform(post("/api/events/{id}/publish", id)).andExpect(status().isOk());
-        // already published
-        mockMvc.perform(post("/api/events/{id}/publish", id)).andExpect(status().isConflict());
-    }
-
-    @Test
-    void theCapacityOfAPublishedEventCanGrowButNotShrink() throws Exception {
-        String title = uniqueTitle("capacity");
-        String id = createEvent(title, 100);
-        mockMvc.perform(post("/api/events/{id}/publish", id)).andExpect(status().isOk());
-
-        mockMvc.perform(put("/api/events/{id}", id)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body(title, 50)))
+                .andExpect(jsonPath("$.status").value("DRAFT"));
+        mockMvc.perform(patch("/api/v1/events/{id}/publish", eventId))
                 .andExpect(status().isConflict());
+        mockMvc.perform(get("/api/v1/events").param("size", "101"))
+                .andExpect(status().isBadRequest());
 
-        mockMvc.perform(put("/api/events/{id}", id)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body(title, 150)))
+        String tierBody = """
+                {"name":"Standard","description":"General admission","price":150.00,"quantity":80,
+                 "salesStartDate":"%s","salesEndDate":"%s"}
+                """.formatted(Instant.now().minus(1, ChronoUnit.DAYS), start.minus(1, ChronoUnit.DAYS));
+        String tierLocation = mockMvc.perform(post("/api/v1/events/{eventId}/ticket-tiers", eventId)
+                        .contentType(MediaType.APPLICATION_JSON).content(tierBody))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getHeader("Location");
+        String tierId = tierLocation.substring(tierLocation.lastIndexOf('/') + 1);
+        mockMvc.perform(get("/api/v1/internal/events/{eventId}/ticket-tiers/{ticketTierId}", eventId, tierId))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.capacity").value(150));
+                .andExpect(jsonPath("$.eventId").value(Integer.parseInt(eventId)))
+                .andExpect(jsonPath("$.name").value("Standard"));
+
+        mockMvc.perform(patch("/api/v1/events/{id}/publish", eventId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PUBLISHED"))
+                .andExpect(jsonPath("$.ticketTiers.length()").value(1));
+        mockMvc.perform(get("/api/v1/events/{id}", eventId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.title").value(title));
+        mockMvc.perform(get("/api/v1/events").param("keyword", title).param("city", "rab"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content.length()").value(1));
+        mockMvc.perform(delete("/api/v1/venues/{id}", venueId))
+                .andExpect(status().isConflict());
     }
 
     @Test
-    void unknownEventReturns404() throws Exception {
-        mockMvc.perform(get("/api/events/{id}", 999999)).andExpect(status().isNotFound());
+    void rejectsInvalidTierValuesAndInvalidEventDates() throws Exception {
+        long venueId = createVenue();
+        long categoryId = createCategory();
+        Instant start = Instant.now().plus(5, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS);
+        String invalidEvent = """
+                {"title":"Bad event","description":"Description","startDateTime":"%s","endDateTime":"%s",
+                 "venueId":%d,"categoryId":%d,"capacity":20}
+                """.formatted(start, start.minus(1, ChronoUnit.DAYS), venueId, categoryId);
+        mockMvc.perform(post("/api/v1/events").contentType(MediaType.APPLICATION_JSON).content(invalidEvent))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.message").exists());
+    }
+
+    private long createVenue() throws Exception {
+        String body = """
+                {"name":"Venue-%s","address":"1 Main Street","city":"Rabat","country":"Morocco",
+                 "description":"Concert hall","capacity":200}
+                """.formatted(UUID.randomUUID());
+        String location = mockMvc.perform(post("/api/v1/venues").contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated()).andReturn().getResponse().getHeader("Location");
+        return Long.parseLong(location.substring(location.lastIndexOf('/') + 1));
+    }
+
+    private long createCategory() throws Exception {
+        String body = """
+                {"name":"Category-%s","description":"Music"}
+                """.formatted(UUID.randomUUID());
+        String location = mockMvc.perform(post("/api/v1/categories").contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated()).andReturn().getResponse().getHeader("Location");
+        return Long.parseLong(location.substring(location.lastIndexOf('/') + 1));
     }
 }

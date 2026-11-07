@@ -6,19 +6,21 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import com.ticketflow.eventservice.dto.EventRequest;
+import com.ticketflow.eventservice.dto.request.EventRequest;
+import com.ticketflow.eventservice.entities.Category;
 import com.ticketflow.eventservice.entities.Event;
 import com.ticketflow.eventservice.entities.EventStatus;
-import com.ticketflow.eventservice.exceptions.EventNotFoundException;
+import com.ticketflow.eventservice.entities.Venue;
+import com.ticketflow.eventservice.exceptions.BusinessException;
+import com.ticketflow.eventservice.repos.CategoryRepo;
 import com.ticketflow.eventservice.repos.EventRepo;
-import java.math.BigDecimal;
+import com.ticketflow.eventservice.repos.TicketTierRepo;
+import com.ticketflow.eventservice.repos.VenueRepo;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
-import java.util.List;
 import java.util.Optional;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -26,56 +28,48 @@ import org.mockito.junit.jupiter.MockitoExtension;
 class EventServiceTest {
 
     @Mock
-    EventRepo repo;
+    EventRepo eventRepo;
+    @Mock
+    VenueRepo venueRepo;
+    @Mock
+    CategoryRepo categoryRepo;
+    @Mock
+    TicketTierRepo ticketTierRepo;
 
-    @InjectMocks
-    EventService service;
+    private EventService service;
 
-    private final EventRequest request = new EventRequest("Concert", "Live", "Casablanca",
-            Instant.now().plus(30, ChronoUnit.DAYS), new BigDecimal("150.00"), 100);
-
-    @Test
-    void createSavesADraft() {
-        when(repo.save(any(Event.class))).thenAnswer(inv -> inv.getArgument(0));
-
-        Event saved = service.create(request);
-
-        assertThat(saved.getStatus()).isEqualTo(EventStatus.DRAFT);
-        assertThat(saved.getTitle()).isEqualTo("Concert");
-        verify(repo).save(any(Event.class));
+    @BeforeEach
+    void setUp() {
+        service = new EventService(eventRepo, venueRepo, categoryRepo, ticketTierRepo);
     }
 
     @Test
-    void getThrowsWhenTheEventDoesNotExist() {
-        when(repo.findById(42L)).thenReturn(Optional.empty());
+    void createSavesAnEventAsDraft() {
+        Venue venue = new Venue("Hall", "1 Main Street", "Rabat", "Morocco", null, 100);
+        Category category = new Category("Music", null);
+        when(venueRepo.findById(1L)).thenReturn(Optional.of(venue));
+        when(categoryRepo.findById(2L)).thenReturn(Optional.of(category));
+        when(eventRepo.save(any(Event.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        Instant start = Instant.now().plusSeconds(3600);
+        EventRequest request = new EventRequest("Concert", "Live", start, start.plusSeconds(3600),
+                null, 1L, 2L, 80);
 
-        assertThatThrownBy(() -> service.get(42L)).isInstanceOf(EventNotFoundException.class);
+        Event event = service.create(request);
+
+        assertThat(event.getStatus()).isEqualTo(EventStatus.DRAFT);
+        assertThat(event.getCapacity()).isEqualTo(80);
+        verify(eventRepo).save(any(Event.class));
     }
 
     @Test
-    void publishMovesTheEventToPublished() {
-        Event event = new Event("Concert", "Live", "Casablanca",
-                Instant.now().plus(30, ChronoUnit.DAYS), new BigDecimal("150.00"), 100);
-        when(repo.findById(1L)).thenReturn(Optional.of(event));
+    void publicationWithoutTicketTiersIsRejected() {
+        Event event = new Event("Concert", "Live", Instant.now().plusSeconds(3600),
+                Instant.now().plusSeconds(7200), null,
+                new Venue("Hall", "1 Main Street", "Rabat", "Morocco", null, 100),
+                new Category("Music", null), 80);
+        when(eventRepo.findWithDetailsById(1L)).thenReturn(Optional.of(event));
 
-        assertThat(service.publish(1L).getStatus()).isEqualTo(EventStatus.PUBLISHED);
-    }
-
-    @Test
-    void listWithoutVenueReturnsAllPublishedEvents() {
-        when(repo.findByStatusOrderByStartsAtAsc(EventStatus.PUBLISHED)).thenReturn(List.of());
-
-        assertThat(service.listPublished(null)).isEmpty();
-        assertThat(service.listPublished("  ")).isEmpty();
-        verify(repo, org.mockito.Mockito.times(2)).findByStatusOrderByStartsAtAsc(EventStatus.PUBLISHED);
-    }
-
-    @Test
-    void listWithVenueFiltersOnTheTrimmedVenue() {
-        when(repo.findByStatusAndVenueIgnoreCaseOrderByStartsAtAsc(EventStatus.PUBLISHED, "Rabat"))
-                .thenReturn(List.of());
-
-        assertThat(service.listPublished("  Rabat ")).isEmpty();
-        verify(repo).findByStatusAndVenueIgnoreCaseOrderByStartsAtAsc(EventStatus.PUBLISHED, "Rabat");
+        assertThatThrownBy(() -> service.publish(1L)).isInstanceOf(BusinessException.class)
+                .hasMessageContaining("at least one ticket tier");
     }
 }

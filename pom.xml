@@ -28,7 +28,9 @@
         <module>services/gateway-api</module>
         <module>services/Discovery-service</module>
         <module>services/Config-service</module>
-
+        <module>services/event-service</module>
+        <module>services/booking-service</module>
+        <module>services/payment-service</module>
 
     </modules>
 

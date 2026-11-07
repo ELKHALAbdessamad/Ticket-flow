@@ -1,102 +1,54 @@
-# event-service
+# Event Service
 
-> Events catalog: the second business microservice of TicketFlow.
+Event Service owns the TicketFlow event catalogue, venues, categories and ticket-offer
+metadata. Booking Service remains responsible for reservations and transactional inventory.
 
-## Concept illustrated
-A second REST service, built exactly like `customer-service`, that **registers itself
-in Eureka** from day one. The point of this step: the service becomes reachable through
-the gateway **without any change in the gateway** (discovery locator).
+## Architecture
 
-It also shows a small **life cycle** (state machine) enforced by the domain object:
-`DRAFT -> PUBLISHED -> CLOSED`.
+The service uses controllers for HTTP/DTO mapping, transactional services for business
+rules, Spring Data repositories for persistence, and JPA entities for event lifecycle
+transitions. Public endpoints return response DTOs only. The H2 database is in-memory;
+the service registers with Eureka and imports optional central configuration.
 
-## Overview
-- **Port:** 8082
-- **Database:** H2 in-memory (recreated on every start)
-- **Depends on:** `discovery-server` (8761), only to register itself; the API works without it
+## API
 
-| Method | Path | Description |
+All endpoints are under `/api/v1`.
+
+| Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/events` | Create an event (201 + Location), always as a `DRAFT` |
-| GET | `/api/events` | Public catalog: **PUBLISHED** events only, ordered by date. Optional `?venue=` filter |
-| GET | `/api/events/{id}` | Get one event, whatever its status |
-| PUT | `/api/events/{id}` | Update an event |
-| POST | `/api/events/{id}/publish` | `DRAFT -> PUBLISHED` |
-| POST | `/api/events/{id}/close` | `PUBLISHED -> CLOSED` |
+| GET | `/events` | Search published events; supports `keyword`, `categoryId`, `city`, `venue`, `dateFrom`, `dateTo`, `minPrice`, `maxPrice`, `page`, `size`, `sort`, `direction` |
+| GET | `/events/{id}` | Read a published event |
+| GET | `/management/events/{id}` | Read an event including a draft |
+| POST/PUT/DELETE | `/events[/{id}]` | Create, update or delete a draft |
+| PATCH | `/events/{id}/publish` | Publish a valid draft with ticket offers |
+| PATCH | `/events/{id}/close` | Close a published event |
+| PATCH | `/events/{id}/cancel` | Cancel a draft or published event |
+| GET/POST | `/venues` | List or create venues |
+| GET/PUT/DELETE | `/venues/{id}` | Read, update or delete a venue |
+| GET/POST | `/categories` | List or create categories |
+| GET/PUT/DELETE | `/categories/{id}` | Read, update or delete a category |
+| GET | `/events/{eventId}/ticket-tiers` | List offers for a published event |
+| POST | `/events/{eventId}/ticket-tiers` | Add an offer to a draft |
+| GET/PUT/DELETE | `/ticket-tiers/{id}` | Read, update or delete an offer |
 
-Fields: `title`, `description`, `venue`, `startsAt` (ISO-8601, must be in the future),
-`price` (>= 0), `capacity` (>= 1), `status`.
+Search page size is restricted to 1–100. Sort fields are restricted to `startDateTime`,
+`title`, `createdAt` and `updatedAt`. A public event response includes venue location
+details and ticket-tier DTOs; it never includes a draft, closed or cancelled event.
 
-Business rules:
-- A `CLOSED` event cannot be modified.
-- Once `PUBLISHED`, the capacity can grow but never be lowered: seats may already be sold, and the
-  booking service (a later step) owns that count.
-- An invalid transition (publish twice, close a draft...) answers **409**.
+Event and ticket-tier edits are restricted to drafts so that published catalogue data
+cannot silently conflict with ongoing sales. Event capacity cannot exceed venue capacity,
+ticket quantities cannot exceed event capacity, and used venues/categories cannot be
+deleted. Error responses include `timestamp`, `status`, `error`, `message` and `path`.
 
-Errors follow RFC 9457 (`ProblemDetail`): 400 validation, 404 not found, 409 invalid state.
+## Run and test
 
-> There is no security yet: `GET /api/events/{id}` also returns drafts. Access control
-> arrives in `step-10-security`.
+From the repository root:
 
-## Package layout
-    controllers/   REST endpoints
-    service/       business logic
-    repos/         Spring Data repositories
-    entities/      JPA entity + life cycle rules (Event, EventStatus)
-    dto/           request/response records (the API contract)
-    exceptions/    domain exceptions and their HTTP mapping
+```powershell
+.\mvnw.cmd -pl services/event-service -am spring-boot:run
+.\mvnw.cmd -pl services/event-service -am test
+```
 
-## Service discovery
-The service registers itself in Eureka under the name `event-service`
-(`spring.application.name`). Eureka address: `eureka.client.service-url.defaultZone`,
-overridable with the `EUREKA_URL` environment variable (default `http://localhost:8761/eureka/`).
-
-## Central configuration
-The service imports shared configuration from the Config Server
-(`spring.config.import=optional:configserver:...`, default `http://localhost:8888`, `CONFIG_SERVER_URL` in Compose).
-It gets `config-repo/application.yml`; add `config-repo/event-service.yml` for settings specific to it.
-The service still starts without the Config Server (`optional:`).
-
-## Run locally
-Optional: start the registry first (`./mvnw -pl services/discovery-server spring-boot:run`).
-
-    ./mvnw -pl services/event-service spring-boot:run
-
-Create, publish and list an event (replace the date by a future one):
-
-    curl -i -X POST localhost:8082/api/events \
-      -H 'Content-Type: application/json' \
-      -d '{"title":"Gnawa Festival","venue":"Essaouira","startsAt":"2030-06-20T20:00:00Z","price":250.00,"capacity":500}'
-
-    curl -i -X POST localhost:8082/api/events/1/publish
-    curl localhost:8082/api/events
-
-## Through the gateway (no gateway change needed)
-With discovery-server, event-service and api-gateway running, wait about 30 s and call:
-
-    curl localhost:8080/event-service/api/events
-
-The gateway discovered `event-service` on its own and created the route `/event-service/**`.
-
-## Run with Docker
-    docker compose -f infra/docker-compose.yml up --build event-service
-
-## Run the tests
-    ./mvnw -pl services/event-service test
-
-Tests run with `eureka.client.enabled=false`, so no registry is needed.
-
-## Exercise
-1. Start the three services and open http://localhost:8761. Which names appear? Call
-   `event-service` through the gateway. What did you have to change in the gateway?
-2. Try to lower the capacity of a published event, then to modify a closed one. Which
-   status do you get, and why 409 rather than 400?
-3. Add a `GET /api/events?from=...&to=...` filter on the date, with a test.
-
-## Common pitfalls
-- A new event is a `DRAFT` and does **not** appear in the catalog until it is published.
-- `startsAt` must be a future ISO-8601 instant (`2030-06-20T20:00:00Z`); a past date answers 400.
-- Business rules live in the `Event` entity (`publish()`, `close()`, `update(...)`), not in the
-  controller: they are unit-tested without Spring or a database.
-- An in-memory database is fine for learning but never shared between services:
-  each service owns its data.
+Port: `8082`. The API remains usable without Eureka or Config Server. Booking Service
+reads published event data from `GET /api/v1/events/{id}`; its compact client view uses
+the least expensive published ticket tier as the compatibility `price` field.
